@@ -32,7 +32,7 @@
     },
     "models-dir": {
         "pipeline": "",
-        "vlm": "/mnt/g/huggingface_models/mineru_2_5_2604/"
+        "vlm": "/data/disk1/mineru_model/mineru_25pro2604"
     },
     "config_version": "1.3.1"
 }

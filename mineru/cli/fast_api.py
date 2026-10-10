@@ -27,6 +27,7 @@ from fastapi import (
     File,
     Form,
     HTTPException,
+    Query,
     Request,
     UploadFile,
 )
@@ -62,6 +63,7 @@ from mineru.cli.public_http_client_policy import (
 from mineru.cli.output_paths import resolve_parse_dir
 from mineru.cli.api_protocol import (
     API_PROTOCOL_VERSION,
+    CompatContentResponse,
     DEFAULT_MAX_CONCURRENT_REQUESTS,
     DEFAULT_PROCESSING_WINDOW_SIZE,
 )
@@ -2214,8 +2216,37 @@ async def get_async_task_result(
     )
 
 
-@app.get(path="/content")
-async def get_parse_content(ocr_id: str):
+@app.get(
+    path="/content",
+    summary="Poll legacy parsing content",
+    description=(
+        "Poll an ocr_id returned by the legacy POST /file_parse endpoint. content is "
+        "null while status is PENDING or RUNNING; FINISHED returns backend, version, "
+        "and per-file Markdown/chunks/images; FAIL returns an error object."
+    ),
+    response_model=CompatContentResponse,
+    response_description="Legacy task state and content payload.",
+    responses={
+        404: {
+            "description": "ocr_id was not found.",
+            "content": {
+                "application/json": {
+                    "schema": {
+                        "type": "object",
+                        "required": ["error"],
+                        "properties": {"error": {"type": "string"}},
+                    }
+                }
+            },
+        }
+    },
+)
+async def get_parse_content(
+    ocr_id: Annotated[
+        str,
+        Query(description="ocr_id returned by POST /file_parse."),
+    ],
+):
     job_store = get_job_store()
     job_info = job_store.get_job(ocr_id)
     if job_info is None:

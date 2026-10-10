@@ -57,3 +57,6 @@ _build/
 
 
 output/
+
+# Others
+/UNCOMMITTED_CODE_REVIEW.md

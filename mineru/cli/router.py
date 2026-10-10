@@ -15,15 +15,16 @@ from contextlib import ExitStack, asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional, Sequence
+from typing import Annotated, Any, Literal, Optional, Sequence
 
 import click
 import httpx
 import uvicorn
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Path as ApiPath, Query, Request
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from loguru import logger
+from pydantic import BaseModel, ConfigDict, Field
 from starlette.background import BackgroundTask
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
@@ -40,7 +41,7 @@ from mineru.cli.api_client import (
     strip_local_api_network_args,
     response_detail,
 )
-from mineru.cli.api_protocol import API_PROTOCOL_VERSION
+from mineru.cli.api_protocol import API_PROTOCOL_VERSION, CompatContentResponse
 from mineru.cli.job_store import JobStore
 from mineru.cli.common import normalize_upload_filename
 from mineru.cli.public_http_client_policy import (
@@ -97,6 +98,252 @@ RESULT_IMAGE_SUFFIXES = {
     "webp",
     "svg",
 }
+
+ROUTER_OPENAPI_TAGS = [
+    {
+        "name": "Task API",
+        "description": "Submit asynchronous tasks, inspect their state, and fetch results.",
+    },
+    {
+        "name": "Synchronous API",
+        "description": "Submit work and wait for the parsing result in one request.",
+    },
+    {
+        "name": "Compatibility API",
+        "description": (
+            "Legacy ocr_id-based APIs. Use /file_parse_router to submit and "
+            "/content_router to poll."
+        ),
+    },
+    {
+        "name": "Service",
+        "description": "Router and worker-pool health information.",
+    },
+]
+
+ROUTER_PARSE_FORM_PROPERTIES: dict[str, Any] = {
+    "files": {
+        "type": "array",
+        "items": {"type": "string", "format": "binary"},
+        "description": "PDF, image, DOCX, PPTX, or XLSX files to parse.",
+    },
+    "ocr_id": {
+        "type": "string",
+        "description": "Optional caller-provided task id. Intended for compatibility clients.",
+    },
+    "lang_list": {
+        "type": "array",
+        "items": {"type": "string"},
+        "default": ["ch"],
+        "description": "OCR language codes; primarily used by pipeline and hybrid backends.",
+    },
+    "backend": {
+        "type": "string",
+        "default": "hybrid-auto-engine",
+        "description": (
+            "Parsing backend, for example pipeline, vlm-auto-engine, "
+            "vlm-http-client, hybrid-auto-engine, or hybrid-http-client."
+        ),
+    },
+    "parse_method": {
+        "type": "string",
+        "enum": ["auto", "txt", "ocr"],
+        "default": "auto",
+        "description": "PDF parsing method used by pipeline and hybrid backends.",
+    },
+    "formula_enable": {
+        "type": "boolean",
+        "default": True,
+        "description": "Enable formula parsing.",
+    },
+    "table_enable": {
+        "type": "boolean",
+        "default": True,
+        "description": "Enable table parsing.",
+    },
+    "image_analysis": {
+        "type": "boolean",
+        "default": True,
+        "description": "Enable image and chart analysis for VLM and hybrid backends.",
+    },
+    "server_url": {
+        "type": "string",
+        "description": "OpenAI-compatible server URL for an *-http-client backend.",
+    },
+    "return_md": {
+        "type": "boolean",
+        "default": True,
+        "description": "Include Markdown in the JSON result.",
+    },
+    "return_middle_json": {
+        "type": "boolean",
+        "default": True,
+        "description": "Include MinerU intermediate JSON in the result.",
+    },
+    "return_model_output": {
+        "type": "boolean",
+        "default": False,
+        "description": "Include raw model output in the result.",
+    },
+    "return_content_list": {
+        "type": "boolean",
+        "default": False,
+        "description": "Include the structured content-list JSON in the result.",
+    },
+    "return_images": {
+        "type": "boolean",
+        "default": True,
+        "description": "Include extracted images as base64 data URLs.",
+    },
+    "response_format_zip": {
+        "type": "boolean",
+        "default": False,
+        "description": "Return a ZIP archive instead of JSON.",
+    },
+    "return_original_file": {
+        "type": "boolean",
+        "default": False,
+        "description": "Include the source file when response_format_zip is true.",
+    },
+    "start_page_id": {
+        "type": "integer",
+        "default": 0,
+        "minimum": 0,
+        "description": "Zero-based first PDF page to parse.",
+    },
+    "end_page_id": {
+        "type": "integer",
+        "default": 99999,
+        "minimum": 0,
+        "description": "Zero-based last PDF page to parse.",
+    },
+}
+
+ROUTER_PARSE_REQUEST_OPENAPI = {
+    "requestBody": {
+        "required": True,
+        "content": {
+            "multipart/form-data": {
+                "schema": {
+                    "type": "object",
+                    "required": ["files"],
+                    "properties": ROUTER_PARSE_FORM_PROPERTIES,
+                }
+            }
+        },
+    }
+}
+
+ROUTER_COMPAT_FORM_PROPERTIES: dict[str, Any] = {
+    "files": ROUTER_PARSE_FORM_PROPERTIES["files"],
+    "ocr_id": {
+        "type": "string",
+        "description": "Task id for a single uploaded file.",
+    },
+    "ocr_ids": {
+        "type": "array",
+        "items": {"type": "string"},
+        "description": (
+            "Optional task ids in the same order as files. A JSON string array or "
+            "comma-separated value is also accepted. Do not combine with ocr_id."
+        ),
+    },
+}
+
+ROUTER_COMPAT_REQUEST_OPENAPI = {
+    "requestBody": {
+        "required": True,
+        "content": {
+            "multipart/form-data": {
+                "schema": {
+                    "type": "object",
+                    "required": ["files"],
+                    "properties": ROUTER_COMPAT_FORM_PROPERTIES,
+                }
+            }
+        },
+    }
+}
+
+
+class RouterDetailErrorResponse(BaseModel):
+    detail: str = Field(description="Human-readable error detail.")
+
+
+class RouterCompatErrorResponse(BaseModel):
+    error: str = Field(description="Human-readable compatibility API error.")
+    ocr_ids: list[str] | None = Field(
+        default=None,
+        description="Task ids submitted successfully before a partial batch failure.",
+    )
+
+
+class RouterTaskStatusResponse(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    task_id: str = Field(description="Router task identifier.")
+    status: Literal["pending", "processing", "completed", "failed"] = Field(
+        description="Current task state."
+    )
+    backend: str = Field(description="Selected parsing backend.")
+    file_names: list[str] = Field(description="Uploaded filenames handled by the task.")
+    created_at: str = Field(description="ISO 8601 task creation time.")
+    started_at: str | None = Field(description="ISO 8601 processing start time.")
+    completed_at: str | None = Field(description="ISO 8601 terminal-state time.")
+    error: str | None = Field(description="Failure detail; null unless the task failed.")
+    status_url: str = Field(description="Absolute URL of the task status endpoint.")
+    result_url: str = Field(description="Absolute URL of the task result endpoint.")
+    queued_ahead: int | None = Field(
+        default=None,
+        description="Number of tasks ahead in the selected worker queue, when known.",
+    )
+    message: str | None = Field(default=None, description="Additional status message.")
+
+
+class RouterParseResultResponse(RouterTaskStatusResponse):
+    version: str = Field(description="MinerU version that produced the result.")
+    results: dict[str, dict[str, Any]] = Field(
+        description=(
+            "Outputs keyed by uploaded filename. Included fields depend on the "
+            "return_* form options."
+        )
+    )
+
+
+class RouterCompatSubmissionResponse(BaseModel):
+    ocr_ids: list[str] = Field(
+        description="Submitted task ids in the same order as the uploaded files."
+    )
+
+
+class RouterWorkerHealth(BaseModel):
+    server_id: str
+    base_url: str
+    source: Literal["local", "remote"]
+    healthy: bool
+    gpu: str | None
+    queued_tasks: int
+    processing_tasks: int
+    completed_tasks: int
+    failed_tasks: int
+    max_concurrent_requests: int
+    processing_window_size: int
+    last_error: str | None
+    last_checked_at: str | None
+
+
+class RouterHealthResponse(BaseModel):
+    status: Literal["healthy", "unhealthy"] = Field(description="Overall router health.")
+    version: str
+    protocol_version: int
+    queued_tasks: int
+    processing_tasks: int
+    completed_tasks: int
+    failed_tasks: int
+    max_concurrent_requests: int
+    processing_window_size: int
+    servers: list[RouterWorkerHealth]
+    error: str | None = Field(default=None, description="Present when no worker is healthy.")
 
 
 def utc_now_iso() -> str:
@@ -1875,9 +2122,18 @@ def create_app(settings: RouterSettings | None = None) -> FastAPI:
             await shutdown_router_state(app)
 
     app = FastAPI(
+        title="MinerU Router API",
+        summary="Unified task routing for one or more MinerU API workers.",
+        description=(
+            "Submit document parsing requests through a shared entry point. The "
+            "router selects a healthy worker, tracks task state, and proxies or "
+            "rebuilds parsing results."
+        ),
+        version=__version__,
         openapi_url="/openapi.json" if enable_docs else None,
         docs_url="/docs" if enable_docs else None,
         redoc_url="/redoc" if enable_docs else None,
+        openapi_tags=ROUTER_OPENAPI_TAGS,
         lifespan=lifespan,
     )
     app.state.router_settings = resolved_settings
@@ -1894,7 +2150,28 @@ def create_app(settings: RouterSettings | None = None) -> FastAPI:
     )
     app.add_middleware(GZipMiddleware, minimum_size=1000)
 
-    @app.post(path="/tasks", status_code=202)
+    @app.post(
+        path="/tasks",
+        status_code=202,
+        tags=["Task API"],
+        summary="Submit an asynchronous parse task",
+        description=(
+            "Upload one or more documents. The router forwards the multipart form "
+            "to a healthy MinerU worker and immediately returns a task id. Poll the "
+            "returned status_url, then download the result_url after completion."
+        ),
+        response_model=RouterTaskStatusResponse,
+        response_model_exclude_none=True,
+        response_description="The accepted task and its polling URLs.",
+        responses={
+            400: {"model": RouterDetailErrorResponse, "description": "Invalid form data."},
+            503: {
+                "model": RouterDetailErrorResponse,
+                "description": "No healthy upstream worker is available.",
+            },
+        },
+        openapi_extra=ROUTER_PARSE_REQUEST_OPENAPI,
+    )
     async def submit_parse_task(http_request: Request):
         payload = await stage_multipart_request(http_request)
         try:
@@ -1905,8 +2182,29 @@ def create_app(settings: RouterSettings | None = None) -> FastAPI:
         response_payload["message"] = "Task submitted successfully"
         return JSONResponse(status_code=202, content=response_payload)
 
-    @app.get(path="/tasks/{task_id}", name="get_router_task_status")
-    async def get_router_task_status(task_id: str, request: Request):
+    @app.get(
+        path="/tasks/{task_id}",
+        name="get_router_task_status",
+        tags=["Task API"],
+        summary="Get task status",
+        description=(
+            "Return the latest router-visible state of an asynchronous parsing task. "
+            "Terminal tasks remain queryable until the configured retention period expires."
+        ),
+        response_model=RouterTaskStatusResponse,
+        response_model_exclude_none=True,
+        response_description="Current task state and result URL.",
+        responses={
+            404: {"model": RouterDetailErrorResponse, "description": "Task not found."}
+        },
+    )
+    async def get_router_task_status(
+        task_id: Annotated[
+            str,
+            ApiPath(description="Task id returned by POST /tasks."),
+        ],
+        request: Request,
+    ):
         registry: RouterTaskRegistry = request.app.state.router_task_registry
         task = await registry.get(task_id)
         if task is None:
@@ -1914,8 +2212,49 @@ def create_app(settings: RouterSettings | None = None) -> FastAPI:
         task = await fetch_router_task_status(request, task)
         return task.to_status_payload(request)
 
-    @app.get(path="/tasks/{task_id}/result", name="get_router_task_result")
-    async def get_router_task_result(task_id: str, request: Request):
+    @app.get(
+        path="/tasks/{task_id}/result",
+        name="get_router_task_result",
+        tags=["Task API"],
+        summary="Get task result",
+        description=(
+            "Return 202 while parsing is still in progress, 409 when parsing failed, "
+            "or proxy the completed worker result. The completed response is JSON by "
+            "default and is a ZIP archive when response_format_zip=true was submitted."
+        ),
+        response_model=RouterParseResultResponse,
+        response_model_exclude_none=True,
+        response_description="Completed JSON result or a ZIP archive.",
+        responses={
+            200: {
+                "content": {
+                    "application/zip": {
+                        "schema": {"type": "string", "format": "binary"}
+                    }
+                }
+            },
+            202: {
+                "model": RouterTaskStatusResponse,
+                "description": "Task result is not ready yet.",
+            },
+            404: {"model": RouterDetailErrorResponse, "description": "Task not found."},
+            409: {
+                "model": RouterTaskStatusResponse,
+                "description": "Task execution failed.",
+            },
+            502: {
+                "model": RouterDetailErrorResponse,
+                "description": "The upstream result could not be retrieved.",
+            },
+        },
+    )
+    async def get_router_task_result(
+        task_id: Annotated[
+            str,
+            ApiPath(description="Task id returned by POST /tasks."),
+        ],
+        request: Request,
+    ):
         registry: RouterTaskRegistry = request.app.state.router_task_registry
         task = await registry.get(task_id)
         if task is None:
@@ -1940,7 +2279,39 @@ def create_app(settings: RouterSettings | None = None) -> FastAPI:
             )
         return await proxy_router_task_result(request, task)
 
-    @app.post(path="/file_parse", status_code=200)
+    @app.post(
+        path="/file_parse",
+        status_code=200,
+        tags=["Synchronous API"],
+        summary="Parse files synchronously",
+        description=(
+            "Upload documents and keep the HTTP request open until parsing reaches a "
+            "terminal state. The same task can also be inspected through the task URLs "
+            "returned in the X-MinerU-* response headers."
+        ),
+        response_model=RouterParseResultResponse,
+        response_model_exclude_none=True,
+        response_description="Completed JSON result or a ZIP archive.",
+        responses={
+            200: {
+                "content": {
+                    "application/zip": {
+                        "schema": {"type": "string", "format": "binary"}
+                    }
+                }
+            },
+            400: {"model": RouterDetailErrorResponse, "description": "Invalid form data."},
+            409: {
+                "model": RouterTaskStatusResponse,
+                "description": "Task execution failed.",
+            },
+            503: {
+                "model": RouterDetailErrorResponse,
+                "description": "No healthy worker is available.",
+            },
+        },
+        openapi_extra=ROUTER_PARSE_REQUEST_OPENAPI,
+    )
     async def file_parse(request: Request):
         payload = await stage_multipart_request(request)
         try:
@@ -1960,7 +2331,36 @@ def create_app(settings: RouterSettings | None = None) -> FastAPI:
 
         return await build_sync_router_task_result_response(request, router_task)
 
-    @app.post(path="/file_parse_router", status_code=200)
+    @app.post(
+        path="/file_parse_router",
+        status_code=200,
+        tags=["Compatibility API"],
+        summary="Submit legacy router-compatible parse tasks",
+        description=(
+            "Submit one task per uploaded file and return ocr_ids immediately. Supply "
+            "ocr_id for one file or ocr_ids for a batch; otherwise ids are generated. "
+            "Legacy parsing-tuning fields are accepted for client compatibility but "
+            "the router applies its fixed compatibility defaults. Poll each id through "
+            "GET /content_router."
+        ),
+        response_model=RouterCompatSubmissionResponse,
+        response_description="Submitted ocr_ids in upload order.",
+        responses={
+            400: {
+                "model": RouterCompatErrorResponse,
+                "description": "Missing files or invalid ocr_id/ocr_ids values.",
+            },
+            500: {
+                "model": RouterCompatErrorResponse,
+                "description": "A batch was only partially submitted or submission failed.",
+            },
+            503: {
+                "model": RouterCompatErrorResponse,
+                "description": "No healthy worker is available.",
+            },
+        },
+        openapi_extra=ROUTER_COMPAT_REQUEST_OPENAPI,
+    )
     async def file_parse_router(request: Request):
         payload = await stage_multipart_request(request)
         submitted_ocr_ids: list[str] = []
@@ -2019,8 +2419,33 @@ def create_app(settings: RouterSettings | None = None) -> FastAPI:
 
         return JSONResponse(status_code=200, content={"ocr_ids": submitted_ocr_ids})
 
-    @app.get(path="/content_router")
-    async def get_parse_content_router(ocr_id: str, request: Request):
+    @app.get(
+        path="/content_router",
+        tags=["Compatibility API"],
+        summary="Poll legacy parsing content",
+        description=(
+            "Return the persisted result for an ocr_id created by "
+            "/file_parse_router. Its response format is compatible with the worker's "
+            "/content endpoint: content is null for PENDING/RUNNING, a result object "
+            "for FINISHED, and an error object for FAIL."
+        ),
+        response_model=CompatContentResponse,
+        response_model_exclude_none=True,
+        response_description="Legacy task state and content payload.",
+        responses={
+            404: {
+                "model": RouterCompatErrorResponse,
+                "description": "ocr_id was not found in a router-managed job store.",
+            }
+        },
+    )
+    async def get_parse_content_router(
+        ocr_id: Annotated[
+            str,
+            Query(description="ocr_id returned by POST /file_parse_router."),
+        ],
+        request: Request,
+    ):
         worker_pool: WorkerPool = request.app.state.worker_pool
         job = find_persisted_router_job(worker_pool, ocr_id)
         if job is None:
@@ -2033,7 +2458,24 @@ def create_app(settings: RouterSettings | None = None) -> FastAPI:
             content=build_persisted_content_response_payload(job),
         )
 
-    @app.get(path="/health")
+    @app.get(
+        path="/health",
+        tags=["Service"],
+        summary="Get router and worker-pool health",
+        description=(
+            "Report aggregate queue counters and the latest health snapshot for every "
+            "local or remote MinerU worker. Returns 503 when no worker is healthy."
+        ),
+        response_model=RouterHealthResponse,
+        response_model_exclude_none=True,
+        response_description="Router health and per-worker metrics.",
+        responses={
+            503: {
+                "model": RouterHealthResponse,
+                "description": "No configured worker is currently healthy.",
+            }
+        },
+    )
     async def health_check(request: Request):
         worker_pool: WorkerPool = request.app.state.worker_pool
         healthy, payload = worker_pool.health_payload()
