@@ -1,32 +1,19 @@
-Thanks for your contribution and we appreciate it a lot. The following instructions would make your pull request more healthy and more easily get feedback. If you do not understand some items, don't worry, just make the pull request and seek help from maintainers.
+<!-- 维护与提交约定见 AGENTS.md；按改动范围填写，无关项可删。 -->
 
-## Motivation
+## 问题与结果
 
-Please describe the motivation of this PR and the goal you want to achieve through this PR.
+说明本次解决的问题和修改后的行为。
 
-## Modification
+## 验证
 
-Please briefly describe what modification is made in this PR.
+列出实际执行的相关检查、结果和未验证项。代码变更按行为和风险选择测试；文档或注释修改检查差异与引用即可。
 
-## BC-breaking (Optional)
+仅在新增行为、边界或回归风险需要时补测试；仅在用户用法或外部契约变化时更新对应文档。无需为填模板执行全量测试、GPU 推理、全仓格式化或重复更新文档。
 
-Does the modification introduce changes that break the backward compatibility of the downstream repositories?
-If so, please describe how it breaks the compatibility and how the downstream projects should modify their code to keep compatibility with this PR.
+## 兼容性（如有）
 
-## Use cases (Optional)
+说明破坏性变更和受影响的下游；确有影响时验证对应项目，不默认跨项目回归。
 
-If this PR introduces a new feature, it is better to list some use cases here and update the documentation.
+## CLA
 
-## Checklist
-
-**Before PR**:
-
-- [ ] Pre-commit or other linting tools are used to fix the potential lint issues.
-- [ ] Bug fixes are fully covered by unit tests, the case that causes the bug should be added in the unit tests.
-- [ ] The modification is covered by complete unit tests. If not, please add more unit test to ensure the correctness.
-- [ ] The documentation has been modified accordingly, like docstring or example tutorials.
-
-**After PR**:
-
-- [ ] If the modification has potential influence on downstream or other related projects, this PR should be tested with those projects.
-- [ ] CLA has been signed and all committers have signed the CLA in this PR.
+PR 参与者仍须遵守现有 CLA 签署流程，见 [MinerU_CLA.md](../MinerU_CLA.md)。
